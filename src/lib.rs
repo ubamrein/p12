@@ -514,14 +514,7 @@ fn pbes2_decrypt(
             pbkdf2::pbkdf2_hmac::<Sha1>(password, salt, params.iteration_count as u32, &mut key)
         }
         AlgorithmIdentifier::HmacWithSha256 => {
-            println!("sha256, {}", params.iteration_count);
-            println!("{password:?}");
-            pbkdf2::pbkdf2_hmac::<Sha256>(
-                b"foihfoqiwafdb23da",
-                salt,
-                params.iteration_count as u32,
-                &mut key,
-            )
+            pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, params.iteration_count as u32, &mut key)
         }
         _ => return None,
     }
@@ -531,11 +524,9 @@ fn pbes2_decrypt(
     };
 
     let decryptor = Aes256CbcDec::new(key.as_slice().into(), iv.as_slice().into());
-    println!("--> {key:?}");
     let result = decryptor
         .decrypt_padded_vec_mut::<Pkcs7>(cipher_text)
-        .unwrap();
-    println!("--> {result:?}");
+        .ok()?;
     Some(result)
 }
 
@@ -1314,13 +1305,4 @@ fn test_pbepkcs12sha1_2() {
     let result = pbepkcs12sha::<Sha1>(&pass, &salt, iterations, id, size);
     let res = hex!("8e9f8fc7664378bc");
     assert_eq!(result, res);
-}
-
-#[test]
-fn test_p12_sha2() {
-    let f = include_bytes!("../issuance.p12");
-    let pfx = PFX::parse(f).unwrap();
-    assert!(pfx.verify_mac("foihfoqiwafdb23da"));
-    pfx.bags("foihfoqiwafdb23da").unwrap();
-    // pbkdf2::pbkdf2_hmac_array(password, salt, rounds)
 }
