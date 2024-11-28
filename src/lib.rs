@@ -114,14 +114,6 @@ impl EncryptedContentInfo {
                 }
             })
         });
-        // let salt = rand::<8>()?.to_vec();
-        // let encrypted_content =
-        //     pbe_with_sha_and40_bit_rc2_cbc_encrypt::<Sha1>(&data, password, &salt, ITERATIONS)?;
-        // let content_encryption_algorithm =
-        //     AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(Pkcs12PbeParams {
-        //         salt,
-        //         iterations: ITERATIONS,
-        //     });
         let encryptor = Encryptor::new();
         encryptor.encrypt::<KDF>(&data, password)
     }
