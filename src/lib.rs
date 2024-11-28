@@ -3,7 +3,7 @@
 //!
 //!
 
-use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use getrandom::getrandom;
 use lazy_static::lazy_static;
 use yasna::{
@@ -18,6 +18,7 @@ use sha2::Sha256;
 type HmacSha1 = Hmac<Sha1>;
 type HmacSha256 = Hmac<Sha256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
 fn as_oid(s: &'static [u64]) -> ObjectIdentifier {
     ObjectIdentifier::from_slice(s)
@@ -102,7 +103,10 @@ impl EncryptedContentInfo {
         yasna::construct_der(|w| self.write(w))
     }
 
-    pub fn from_safe_bags(safe_bags: &[SafeBag], password: &[u8]) -> Option<EncryptedContentInfo> {
+    pub fn from_safe_bags<Encryptor: DataEncryptor, KDF: KeyDeriver>(
+        safe_bags: &[SafeBag],
+        password: &[u8],
+    ) -> Option<EncryptedContentInfo> {
         let data = yasna::construct_der(|w| {
             w.write_sequence_of(|w| {
                 for sb in safe_bags {
@@ -110,18 +114,16 @@ impl EncryptedContentInfo {
                 }
             })
         });
-        let salt = rand()?.to_vec();
-        let encrypted_content =
-            pbe_with_sha_and40_bit_rc2_cbc_encrypt::<Sha1>(&data, password, &salt, ITERATIONS)?;
-        let content_encryption_algorithm =
-            AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(Pkcs12PbeParams {
-                salt,
-                iterations: ITERATIONS,
-            });
-        Some(EncryptedContentInfo {
-            content_encryption_algorithm,
-            encrypted_content,
-        })
+        // let salt = rand::<8>()?.to_vec();
+        // let encrypted_content =
+        //     pbe_with_sha_and40_bit_rc2_cbc_encrypt::<Sha1>(&data, password, &salt, ITERATIONS)?;
+        // let content_encryption_algorithm =
+        //     AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(Pkcs12PbeParams {
+        //         salt,
+        //         iterations: ITERATIONS,
+        //     });
+        let encryptor = Encryptor::new();
+        encryptor.encrypt::<KDF>(&data, password)
     }
 }
 
@@ -135,7 +137,6 @@ impl EncryptedData {
         r.read_sequence(|r| {
             let version = r.next().read_u8()?;
             debug_assert_eq!(version, 0);
-
             let encrypted_content_info = EncryptedContentInfo::parse(r.next())?;
             Ok(EncryptedData {
                 encrypted_content_info,
@@ -151,8 +152,12 @@ impl EncryptedData {
             self.encrypted_content_info.write(w.next());
         })
     }
-    pub fn from_safe_bags(safe_bags: &[SafeBag], password: &[u8]) -> Option<Self> {
-        let encrypted_content_info = EncryptedContentInfo::from_safe_bags(safe_bags, password)?;
+    pub fn from_safe_bags<Encryptor: DataEncryptor, KDF: KeyDeriver>(
+        safe_bags: &[SafeBag],
+        password: &[u8],
+    ) -> Option<Self> {
+        let encrypted_content_info =
+            EncryptedContentInfo::from_safe_bags::<Encryptor, KDF>(safe_bags, password)?;
         Some(EncryptedData {
             encrypted_content_info,
         })
@@ -295,7 +300,7 @@ impl Pbkdf2Params {
             let salt = Pbkdf2Salt::parse(r.next())?;
             let iteration_count = r.next().read_u64()?;
             let key_length = r.read_optional(|r| r.read_u64())?;
-            let prf = r.read_default(AlgorithmIdentifier::HmacWithSha1, |r| {
+            let prf = r.read_default(AlgorithmIdentifier::HmacWithSha1(None), |r| {
                 AlgorithmIdentifier::parse(r)
             })?;
             Ok(Self {
@@ -350,8 +355,8 @@ pub struct OtherAlgorithmIdentifier {
 pub enum AlgorithmIdentifier {
     Sha1,
     Sha2,
-    HmacWithSha1,
-    HmacWithSha256,
+    HmacWithSha1(Option<Vec<u8>>),
+    HmacWithSha256(Option<Vec<u8>>),
     PbewithSHAAnd40BitRC2CBC(Pkcs12PbeParams),
     PbeWithSHAAnd3KeyTripleDESCBC(Pkcs12PbeParams),
     Pbes2(Pkcs12Pbes2Params),
@@ -389,12 +394,12 @@ impl AlgorithmIdentifier {
                 return Ok(AlgorithmIdentifier::Pbkdf2(params));
             }
             if algorithm_type == *OID_HMAC_WITH_SHA1 {
-                let _ = r.read_optional(|r| r.read_der())?;
-                return Ok(AlgorithmIdentifier::HmacWithSha1);
+                let r = r.read_optional(|r| r.read_der())?;
+                return Ok(AlgorithmIdentifier::HmacWithSha1(r));
             }
             if algorithm_type == *OID_HMAC_WITH_SHA256 {
-                let _ = r.read_optional(|r| r.read_der())?;
-                return Ok(AlgorithmIdentifier::HmacWithSha256);
+                let r = r.read_optional(|r| r.read_der())?;
+                return Ok(AlgorithmIdentifier::HmacWithSha256(r));
             }
             if algorithm_type == *OID_AES_CBC_PAD {
                 let iv = r.next().read_bytes()?;
@@ -411,8 +416,8 @@ impl AlgorithmIdentifier {
         match self {
             AlgorithmIdentifier::Sha1 => None,
             AlgorithmIdentifier::Sha2 => None,
-            AlgorithmIdentifier::HmacWithSha1 => None,
-            AlgorithmIdentifier::HmacWithSha256 => None,
+            AlgorithmIdentifier::HmacWithSha1(_) => None,
+            AlgorithmIdentifier::HmacWithSha256(_) => None,
             AlgorithmIdentifier::Pbkdf2(_) => None,
             AlgorithmIdentifier::AesCbcPad(_) => None,
 
@@ -482,14 +487,20 @@ impl AlgorithmIdentifier {
                 w.next().write_oid(&OID_AES_CBC_PAD);
                 w.next().write_bytes(iv);
             }
-            AlgorithmIdentifier::HmacWithSha1 => {
+            AlgorithmIdentifier::HmacWithSha1(r) => {
                 w.next().write_oid(&OID_HMAC_WITH_SHA1);
+                if let Some(r) = r {
+                    w.next().write_bytes(r);
+                }
             }
-            AlgorithmIdentifier::HmacWithSha256 => {
+            AlgorithmIdentifier::HmacWithSha256(r) => {
                 w.next().write_oid(&OID_HMAC_WITH_SHA256);
+                if let Some(r) = r {
+                    w.next().write_bytes(r);
+                }
             }
             AlgorithmIdentifier::Pbkdf2(pbkdf2_params) => {
-                w.next().write_oid(&OID_PBES2);
+                w.next().write_oid(&OID_PBKDF2);
                 pbkdf2_params.write(w.next());
             }
         })
@@ -510,10 +521,10 @@ fn pbes2_decrypt(
     };
     let mut key = vec![0; params.key_length.unwrap_or(32) as usize];
     match params.prf.as_ref() {
-        AlgorithmIdentifier::HmacWithSha1 => {
+        AlgorithmIdentifier::HmacWithSha1(_) => {
             pbkdf2::pbkdf2_hmac::<Sha1>(password, salt, params.iteration_count as u32, &mut key)
         }
-        AlgorithmIdentifier::HmacWithSha256 => {
+        AlgorithmIdentifier::HmacWithSha256(_) => {
             pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, params.iteration_count as u32, &mut key)
         }
         _ => return None,
@@ -522,11 +533,10 @@ fn pbes2_decrypt(
     let AlgorithmIdentifier::AesCbcPad(iv) = encryption_scheme else {
         return None;
     };
-
     let decryptor = Aes256CbcDec::new(key.as_slice().into(), iv.as_slice().into());
     let result = decryptor
         .decrypt_padded_vec_mut::<Pkcs7>(cipher_text)
-        .ok()?;
+        .expect("failed");
     Some(result)
 }
 
@@ -607,7 +617,9 @@ impl MacData {
     }
 
     pub fn new(data: &[u8], password: &[u8]) -> MacData {
-        let salt = rand().unwrap();
+        let salt = rand::<8>().unwrap();
+        let password = std::str::from_utf8(password).unwrap();
+        let password = &bmp_string(password);
         let key = pbepkcs12sha::<Sha1>(password, &salt, ITERATIONS, 3, 20);
         let mut mac = HmacSha1::new_from_slice(&key).unwrap();
         mac.update(data);
@@ -623,12 +635,210 @@ impl MacData {
     }
 }
 
-fn rand() -> Option<[u8; 8]> {
-    let mut buf = [0u8; 8];
+fn rand<const IV_SIZE: usize>() -> Option<[u8; IV_SIZE]> {
+    let mut buf = [0u8; IV_SIZE];
     if getrandom(&mut buf).is_ok() {
         Some(buf)
     } else {
         None
+    }
+}
+
+pub trait DataEncryptor {
+    fn encrypt_keybag<KDF: KeyDeriver>(&self, data: &[u8], password: &[u8]) -> Option<SafeBagKind> {
+        self.encrypt_keybag_key_deriver(data, password, &KDF::default())
+    }
+    fn encrypt_keybag_key_deriver(
+        &self,
+        data: &[u8],
+        password: &[u8],
+        key_deriver: &impl KeyDeriver,
+    ) -> Option<SafeBagKind>;
+    fn encrypt<KDF: KeyDeriver>(
+        &self,
+        data: &[u8],
+        password: &[u8],
+    ) -> Option<EncryptedContentInfo> {
+        self.encrypt_key_deriver(data, password, &KDF::default())
+    }
+    fn encrypt_key_deriver(
+        &self,
+        data: &[u8],
+        password: &[u8],
+        key_deriver: &impl KeyDeriver,
+    ) -> Option<EncryptedContentInfo>;
+
+    fn new() -> impl DataEncryptor;
+}
+pub trait KeyDeriver: Default {
+    fn derive_key(&self, password: &[u8]) -> Option<Vec<u8>>;
+    fn get_algorithm(&self) -> AlgorithmIdentifier;
+    fn new(alg: AlgorithmIdentifier) -> impl KeyDeriver;
+}
+
+pub struct AesCbcDataEncryptor {
+    iv: Vec<u8>,
+}
+pub struct Pbkdf2(AlgorithmIdentifier);
+
+impl Default for Pbkdf2 {
+    fn default() -> Self {
+        Self(AlgorithmIdentifier::Pbkdf2(Pbkdf2Params {
+            salt: Pbkdf2Salt::Specified(rand::<16>().unwrap().to_vec()),
+            iteration_count: 2048,
+            key_length: None,
+            prf: Box::new(AlgorithmIdentifier::HmacWithSha256(None)),
+        }))
+    }
+}
+
+impl KeyDeriver for Pbkdf2 {
+    fn derive_key(&self, password: &[u8]) -> Option<Vec<u8>> {
+        let AlgorithmIdentifier::Pbkdf2(params) = &self.0 else {
+            return None;
+        };
+        let Pbkdf2Salt::Specified(salt) = &params.salt else {
+            return None;
+        };
+        let mut key = vec![0; params.key_length.unwrap_or(32) as usize];
+        match params.prf.as_ref() {
+            AlgorithmIdentifier::HmacWithSha1(_) => {
+                pbkdf2::pbkdf2_hmac::<Sha1>(password, salt, params.iteration_count as u32, &mut key)
+            }
+            AlgorithmIdentifier::HmacWithSha256(_) => pbkdf2::pbkdf2_hmac::<Sha256>(
+                password,
+                salt,
+                params.iteration_count as u32,
+                &mut key,
+            ),
+            _ => return None,
+        }
+        Some(key)
+    }
+
+    fn new(alg: AlgorithmIdentifier) -> impl KeyDeriver {
+        Self(alg)
+    }
+
+    fn get_algorithm(&self) -> AlgorithmIdentifier {
+        self.0.clone()
+    }
+}
+impl DataEncryptor for AesCbcDataEncryptor {
+    fn new() -> impl DataEncryptor {
+        let salt = rand::<16>().unwrap().to_vec();
+        Self { iv: salt }
+    }
+    fn encrypt_keybag_key_deriver(
+        &self,
+        data: &[u8],
+        password: &[u8],
+        key_deriver: &impl KeyDeriver,
+    ) -> Option<SafeBagKind> {
+        let key = key_deriver.derive_key(password)?;
+        let cbc = Aes256CbcEnc::new(key.as_slice().into(), self.iv.as_slice().into());
+        let encrypted_data = cbc.encrypt_padded_vec_mut::<Pkcs7>(data);
+        Some(SafeBagKind::Pkcs8ShroudedKeyBag(EncryptedPrivateKeyInfo {
+            encryption_algorithm: AlgorithmIdentifier::Pbes2(Pkcs12Pbes2Params {
+                key_derivation_function: Box::new(key_deriver.get_algorithm()),
+                encryption_scheme: Box::new(AlgorithmIdentifier::AesCbcPad(self.iv.clone())),
+            }),
+            encrypted_data,
+        }))
+    }
+
+    fn encrypt_key_deriver(
+        &self,
+        data: &[u8],
+        password: &[u8],
+        key_deriver: &impl KeyDeriver,
+    ) -> Option<EncryptedContentInfo> {
+        let key = key_deriver.derive_key(password)?;
+        let cbc = Aes256CbcEnc::new(key.as_slice().into(), self.iv.as_slice().into());
+        let encrypted_content = cbc.encrypt_padded_vec_mut::<Pkcs7>(data);
+        Some(EncryptedContentInfo {
+            content_encryption_algorithm: AlgorithmIdentifier::Pbes2(Pkcs12Pbes2Params {
+                key_derivation_function: Box::new(key_deriver.get_algorithm()),
+                encryption_scheme: Box::new(AlgorithmIdentifier::AesCbcPad(self.iv.clone())),
+            }),
+            encrypted_content,
+        })
+    }
+}
+
+struct PbeWithShaAnd40BitRc2CbcEncryptKeyDeriver(AlgorithmIdentifier);
+impl Default for PbeWithShaAnd40BitRc2CbcEncryptKeyDeriver {
+    fn default() -> Self {
+        Self(AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(
+            Pkcs12PbeParams {
+                salt: rand::<8>().unwrap().to_vec(),
+                iterations: ITERATIONS,
+            },
+        ))
+    }
+}
+struct PbeWithShaAnd40BitRc2CbcEncryptor;
+
+impl KeyDeriver for PbeWithShaAnd40BitRc2CbcEncryptKeyDeriver {
+    fn derive_key(&self, _password: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn get_algorithm(&self) -> AlgorithmIdentifier {
+        self.0.clone()
+    }
+
+    fn new(alg: AlgorithmIdentifier) -> impl KeyDeriver {
+        Self(alg)
+    }
+}
+impl DataEncryptor for PbeWithShaAnd40BitRc2CbcEncryptor {
+    fn encrypt_keybag_key_deriver(
+        &self,
+        data: &[u8],
+        password: &[u8],
+        _key_deriver: &impl KeyDeriver,
+    ) -> Option<SafeBagKind> {
+        let password = std::str::from_utf8(password).ok()?;
+        let password = bmp_string(password);
+        let salt = rand::<8>()?.to_vec();
+        let encrypted_data =
+            pbe_with_sha_and3_key_triple_des_cbc_encrypt(data, &password, &salt, ITERATIONS)?;
+        let param = Pkcs12PbeParams {
+            salt,
+            iterations: ITERATIONS,
+        };
+        let key_bag_inner = SafeBagKind::Pkcs8ShroudedKeyBag(EncryptedPrivateKeyInfo {
+            encryption_algorithm: AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(param),
+            encrypted_data,
+        });
+        Some(key_bag_inner)
+    }
+
+    fn encrypt_key_deriver(
+        &self,
+        data: &[u8],
+        password: &[u8],
+        _key_deriver: &impl KeyDeriver,
+    ) -> Option<EncryptedContentInfo> {
+        let password = std::str::from_utf8(password).ok()?;
+        let password = bmp_string(password);
+        let salt = rand::<8>()?.to_vec();
+        let encrypted_content =
+            pbe_with_sha_and40_bit_rc2_cbc_encrypt::<Sha1>(data, &password, &salt, ITERATIONS)?;
+        let content_encryption_algorithm =
+            AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(Pkcs12PbeParams {
+                salt,
+                iterations: ITERATIONS,
+            });
+        Some(EncryptedContentInfo {
+            content_encryption_algorithm,
+            encrypted_content,
+        })
+    }
+
+    fn new() -> impl DataEncryptor {
+        Self {}
     }
 }
 
@@ -640,7 +850,7 @@ pub struct PFX {
 }
 
 impl PFX {
-    pub fn new(
+    pub fn new<Encryptor: DataEncryptor, KDF: KeyDeriver>(
         cert_der: &[u8],
         key_der: &[u8],
         ca_der: Option<&[u8]>,
@@ -651,27 +861,17 @@ impl PFX {
         if let Some(ca) = ca_der {
             cas.push(ca);
         }
-        Self::new_with_cas(cert_der, key_der, &cas, password, name)
+        Self::new_with_cas::<Encryptor, KDF>(cert_der, key_der, &cas, password, name)
     }
-    pub fn new_with_cas(
+    pub fn new_with_cas<Encryptor: DataEncryptor, KDF: KeyDeriver>(
         cert_der: &[u8],
         key_der: &[u8],
         ca_der_list: &[&[u8]],
         password: &str,
         name: &str,
     ) -> Option<PFX> {
-        let password = bmp_string(password);
-        let salt = rand()?.to_vec();
-        let encrypted_data =
-            pbe_with_sha_and3_key_triple_des_cbc_encrypt(key_der, &password, &salt, ITERATIONS)?;
-        let param = Pkcs12PbeParams {
-            salt,
-            iterations: ITERATIONS,
-        };
-        let key_bag_inner = SafeBagKind::Pkcs8ShroudedKeyBag(EncryptedPrivateKeyInfo {
-            encryption_algorithm: AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(param),
-            encrypted_data,
-        });
+        let data_encryptor = Encryptor::new();
+        let key_bag_inner = data_encryptor.encrypt_keybag::<KDF>(key_der, password.as_bytes())?;
         let friendly_name = PKCS12Attribute::FriendlyName(name.to_owned());
         let local_key_id = PKCS12Attribute::LocalKeyId(sha::<Sha1>(cert_der));
         let key_bag = SafeBag {
@@ -693,9 +893,12 @@ impl PFX {
         let contents = yasna::construct_der(|w| {
             w.write_sequence_of(|w| {
                 ContentInfo::EncryptedData(
-                    EncryptedData::from_safe_bags(&cert_bags, &password)
-                        .ok_or_else(|| ASN1Error::new(ASN1ErrorKind::Invalid))
-                        .unwrap(),
+                    EncryptedData::from_safe_bags::<Encryptor, KDF>(
+                        &cert_bags,
+                        password.as_bytes(),
+                    )
+                    .ok_or_else(|| ASN1Error::new(ASN1ErrorKind::Invalid))
+                    .unwrap(),
                 )
                 .write(w.next());
                 ContentInfo::Data(yasna::construct_der(|w| {
@@ -706,7 +909,7 @@ impl PFX {
                 .write(w.next());
             });
         });
-        let mac_data = MacData::new(&contents, &password);
+        let mac_data = MacData::new(&contents, password.as_bytes());
         Some(PFX {
             version: 3,
             auth_safe: ContentInfo::Data(contents),
@@ -749,7 +952,6 @@ impl PFX {
             .auth_safe
             .data(password)
             .ok_or_else(|| ASN1Error::new(ASN1ErrorKind::Invalid))?;
-
         let contents = yasna::parse_ber(&data, |r| r.collect_sequence_of(ContentInfo::parse))?;
 
         let mut result = vec![];
@@ -890,7 +1092,7 @@ fn pbe_with_sha_and40_bit_rc2_cbc_encrypt<D: Digest>(
     salt: &[u8],
     iterations: u64,
 ) -> Option<Vec<u8>> {
-    use cbc::{cipher::BlockEncryptMut, Encryptor};
+    use cbc::Encryptor;
     use rc2::Rc2;
     type Rc2Cbc = Encryptor<Rc2>;
 
@@ -924,7 +1126,7 @@ fn pbe_with_sha_and3_key_triple_des_cbc_encrypt(
     salt: &[u8],
     iterations: u64,
 ) -> Option<Vec<u8>> {
-    use cbc::{cipher::BlockEncryptMut, Encryptor};
+    use cbc::Encryptor;
     use des::TdesEde3;
     type TDesCbc = Encryptor<TdesEde3>;
 
@@ -1214,7 +1416,7 @@ impl SafeBag {
 }
 
 #[test]
-fn test_create_p12() {
+fn test_create_p12_pbes2() {
     use std::fs::File;
     use std::io::{Read, Write};
     let mut cafile = File::open("ca.der").unwrap();
@@ -1226,7 +1428,7 @@ fn test_create_p12() {
     fcert.read_to_end(&mut cert).unwrap();
     let mut key = vec![];
     fkey.read_to_end(&mut key).unwrap();
-    let p12 = PFX::new(&cert, &key, Some(&ca), "changeit", "look")
+    let p12 = PFX::new::<AesCbcDataEncryptor, Pbkdf2>(&cert, &key, Some(&ca), "changeit", "look")
         .unwrap()
         .to_der();
 
@@ -1244,7 +1446,7 @@ fn test_create_p12() {
     fp12.write_all(&p12).unwrap();
 }
 #[test]
-fn test_create_p12_without_password() {
+fn test_create_p12_pbes2_without_password() {
     use std::fs::File;
     use std::io::{Read, Write};
     let mut cafile = File::open("ca.der").unwrap();
@@ -1255,9 +1457,72 @@ fn test_create_p12_without_password() {
     let mut cert = vec![];
     fcert.read_to_end(&mut cert).unwrap();
 
-    let p12 = PFX::new(&cert, &[], Some(&ca), "", "look")
-        .unwrap()
+    let p12 = PFX::new::<AesCbcDataEncryptor, Pbkdf2>(&cert, &[], Some(&ca), "", "look")
+        .expect("failed to generate")
         .to_der();
+
+    let pfx = PFX::parse(&p12).unwrap();
+
+    let certs = pfx.cert_x509_bags("").unwrap();
+    assert_eq!(certs[0], cert);
+    assert_eq!(certs[1], ca);
+    assert!(pfx.verify_mac(""));
+
+    let mut fp12 = File::create("test.p12").unwrap();
+    fp12.write_all(&p12).unwrap();
+}
+
+#[test]
+fn test_create_p12_legacy() {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    let mut cafile = File::open("ca.der").unwrap();
+    let mut ca = vec![];
+    cafile.read_to_end(&mut ca).unwrap();
+    let mut fcert = File::open("clientcert.der").unwrap();
+    let mut fkey = File::open("clientkey.der").unwrap();
+    let mut cert = vec![];
+    fcert.read_to_end(&mut cert).unwrap();
+    let mut key = vec![];
+    fkey.read_to_end(&mut key).unwrap();
+    let p12 = PFX::new::<
+        PbeWithShaAnd40BitRc2CbcEncryptor,
+        PbeWithShaAnd40BitRc2CbcEncryptKeyDeriver,
+    >(&cert, &key, Some(&ca), "changeit", "look")
+    .unwrap()
+    .to_der();
+
+    let pfx = PFX::parse(&p12).unwrap();
+
+    let keys = pfx.key_bags("changeit").unwrap();
+    assert_eq!(keys[0], key);
+
+    let certs = pfx.cert_x509_bags("changeit").unwrap();
+    assert_eq!(certs[0], cert);
+    assert_eq!(certs[1], ca);
+    assert!(pfx.verify_mac("changeit"));
+
+    let mut fp12 = File::create("test.p12").unwrap();
+    fp12.write_all(&p12).unwrap();
+}
+#[test]
+fn test_create_p12_legacy_without_password() {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    let mut cafile = File::open("ca.der").unwrap();
+    let mut ca = vec![];
+    cafile.read_to_end(&mut ca).unwrap();
+    let mut fcert = File::open("clientcert.der").unwrap();
+
+    let mut cert = vec![];
+    fcert.read_to_end(&mut cert).unwrap();
+
+    let p12 = PFX::new::<
+        PbeWithShaAnd40BitRc2CbcEncryptor,
+        PbeWithShaAnd40BitRc2CbcEncryptKeyDeriver,
+    >(&cert, &[], Some(&ca), "", "look")
+    .expect("failed to generate")
+    .to_der();
 
     let pfx = PFX::parse(&p12).unwrap();
 
